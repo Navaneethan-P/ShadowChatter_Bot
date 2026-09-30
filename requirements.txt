@@ -1,3 +1,4 @@
 aiogram
 pymongo
 aiohttp
+openai
