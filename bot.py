@@ -1,24 +1,27 @@
 import asyncio
+import html
 import logging
 import os
 import random
-import re
 import time
-from collections import defaultdict
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import (
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from pymongo import AsyncMongoClient
 from openai import AsyncOpenAI
+from pymongo import AsyncMongoClient, ReturnDocument
 
 
 # =========================================================
@@ -27,22 +30,29 @@ from openai import AsyncOpenAI
 
 TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
-LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+
+# Supergroup with "Topics" enabled, bot must be admin with
+# "Manage topics" permission. Example: -1001234567890
+ARCHIVE_GROUP_ID = os.environ.get("ARCHIVE_GROUP_ID")
 
 PORT = int(os.environ.get("PORT", "10000"))
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-AI_MODEL = "stealth/space-bunny-alpha"
+AI_MODELS = [
+    "stealth/space-bunny-alpha",
+    "meta-llama/llama-3.3-70b-instruct:free",
+]
+AI_TIMEOUT = 25
 
-HEALTH_RESPONSE = "OK"
+HUMAN_WAIT_RANGE = (8.0, 12.0)   # seconds to wait for a human before AI
+REVIEW_TIMEOUT = 600             # finalize reviews after 10 minutes
+MAX_LOGGED_MESSAGES = 500        # per chat, for the safety archive
 
 if not TOKEN:
     raise SystemExit("CRITICAL ERROR: BOT_TOKEN is missing")
-
 if not MONGO_URI:
     raise SystemExit("CRITICAL ERROR: MONGO_URI is missing")
-
 if not OPENROUTER_API_KEY:
     raise SystemExit("CRITICAL ERROR: OPENROUTER_API_KEY is missing")
 
@@ -55,42 +65,30 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
 logger = logging.getLogger("shadowchatter")
 
 
 # =========================================================
-# TELEGRAM
+# CLIENTS
 # =========================================================
 
 bot = Bot(
     token=TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    ),
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
-
 dp = Dispatcher()
 router = Router()
 
-
-# =========================================================
-# DATABASE
-# =========================================================
-
-client = AsyncMongoClient(MONGO_URI)
-
-db = client.anon_chat_db
+mongo = AsyncMongoClient(MONGO_URI)
+db = mongo.anon_chat_db
 
 queue_col = db.queue
 chats_col = db.active_chats
 users_col = db.users
 ai_history_col = db.ai_history
-
-
-# =========================================================
-# AI CLIENT
-# =========================================================
+msgs_col = db.chat_msgs          # temporary message refs for archive
+reviews_col = db.pending_reviews
+counters_col = db.counters
 
 ai_client = AsyncOpenAI(
     base_url=OPENROUTER_BASE_URL,
@@ -99,110 +97,44 @@ ai_client = AsyncOpenAI(
 
 
 # =========================================================
-# MEDIA
+# TEXTS
 # =========================================================
 
-# Replace these placeholder values with REAL Telegram
-# sticker file IDs.
-#
-# Placeholder IDs are automatically ignored.
+PRIVACY_TEXT = (
+    "<b>Privacy & safety</b>\n"
+    "• Chats are anonymous: partners never see your name or username.\n"
+    "• For safety, messages and media of human chats may be kept for "
+    "moderation review (e.g. when someone is reported or rated badly).\n"
+    "• If nobody is online, you'll be paired with an <b>AI companion</b>, "
+    "and the bot will tell you so.\n"
+    "• Never share passwords, OTPs or financial details."
+)
 
-STICKER_MAP = {
-    "laugh": [
-        "CAACAgIAAxkBAAIBY2X9w3w1..."
-    ],
-    "cry": [
-        "CAACAgIAAxkBAAIBZG..."
-    ],
-    "flirt": [
-        "CAACAgIAAxkBAAIBZm..."
-    ],
-    "angry": [
-        "CAACAgIAAxkBAAIBZ2..."
-    ],
-    "wave": [
-        "CAACAgIAAxkBAAIBaG..."
-    ],
-}
-
-
-# =========================================================
-# AI PERSONALITY
-# =========================================================
+WELCOME_TEXT = (
+    "<b>Welcome to Shadow Chatter!</b>\n\n"
+    "Chat anonymously with random people.\n\n"
+    + PRIVACY_TEXT
+    + "\n\nChoose your chat language:"
+)
 
 AI_SYSTEM_PROMPT = """
-You are ShadowChatter's AI conversation partner.
-
-You are an AI companion inside an anonymous Telegram chat.
-
-IMPORTANT:
-- Do not claim to be a real human.
-- If directly asked whether you are an AI, answer honestly.
-- Do not pretend to have real-world experiences you do not have.
-- Otherwise, keep the conversation natural and relaxed.
+You are ShadowChatter's AI companion in an anonymous Telegram chat.
+The user has been told you are an AI. Never claim to be human, and
+answer honestly if asked. Do not invent real-world experiences.
 
 STYLE:
-- Talk naturally, like a casual anonymous chat.
-- Do NOT make every message cute, dramatic, excited, or overly expressive.
-- Do NOT add emojis to every message.
-- Most messages should have zero emojis.
-- When an emoji genuinely fits, use at most one.
-- Avoid repetitive phrases and scripted replies.
-- Do not start every reply with "haha", "lol", "omg", "hey", etc.
-- Sometimes give a short reply.
-- Sometimes ask a natural follow-up.
-- Sometimes simply react.
-- Match the user's energy.
-- If the user is dry, be reasonably dry.
-- If the user is playful, become more playful.
-- Do not force slang.
-- Use words like lol, tbh, idk, rn only when they actually fit.
-- Understand English, Tanglish, Tamil script, and mixed Tamil-English.
-- Reply using the same general language style as the user.
-- Keep normal replies concise: usually 1-3 short sentences.
-
-MEDIA:
-- If the user sends a sticker, photo, voice note, GIF, or other media,
-  react naturally when possible.
-- Do not claim to have seen/heard content that is unavailable to you.
-- Stickers are rare.
-- Do not request stickers in every conversation.
-
-STICKERS:
-
-Available tags:
-
-[STICKER: laugh]
-[STICKER: cry]
-[STICKER: flirt]
-[STICKER: angry]
-[STICKER: wave]
-
-Only use a sticker tag when genuinely appropriate.
-
-laugh:
-- genuinely funny moment
-
-cry:
-- genuinely sad/emotional moment
-
-flirt:
-- clearly playful/flirty conversation
-
-angry:
-- obvious anger/frustration
-
-wave:
-- greeting/goodbye/welcoming moment
-
-A sticker is optional.
-
-If you use a sticker tag, put it at the END of your response.
-
-Never explain the tag to the user.
-
-GIFs are disabled.
-Do not generate GIF tags.
+- Casual, natural chat. Usually 1-3 short sentences.
+- Match the user's energy; dry if they are dry, playful if they are.
+- Mostly no emojis; at most one when it truly fits.
+- Do not start every reply with "haha", "lol", "omg", "hey".
+- Sometimes ask a natural follow-up, sometimes just react.
+- Understand English, Tanglish, Tamil script and mixed text; reply in
+  the user's style.
+- If the user sends media you cannot see, react to the fact that they
+  sent it without pretending to see or hear it.
+- No stickers, no GIF tags, no special tags of any kind.
+- Refuse to help with anything illegal, sexual content involving
+  minors, or self-harm instructions; stay kind and redirect.
 """
 
 
@@ -210,1477 +142,812 @@ Do not generate GIF tags.
 # UI
 # =========================================================
 
-def get_language_keyboard():
+def language_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🇬🇧 English",
-                    callback_data="lang_english",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🇮🇳 Tamil",
-                    callback_data="lang_tamil",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🌍 Global (Any)",
-                    callback_data="lang_global",
-                )
-            ],
+            [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_english")],
+            [InlineKeyboardButton(text="🇮🇳 Tamil", callback_data="lang_tamil")],
+            [InlineKeyboardButton(text="🌍 Global (Any)", callback_data="lang_global")],
         ]
     )
 
 
-async def set_bot_commands(bot_instance: Bot):
-    commands = [
-        BotCommand(
-            command="start",
-            description="Start and set language",
-        ),
-        BotCommand(
-            command="search",
-            description="Find a partner",
-        ),
-        BotCommand(
-            command="next",
-            description="Skip to next partner",
-        ),
-        BotCommand(
-            command="stop",
-            description="End chat",
-        ),
-    ]
+def chat_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⏭ Next", callback_data="action_next"),
+                InlineKeyboardButton(text="⏹ Stop", callback_data="action_stop"),
+                InlineKeyboardButton(text="🚩 Report", callback_data="action_report"),
+            ]
+        ]
+    )
 
-    await bot_instance.set_my_commands(commands)
+
+def search_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Find a Partner", callback_data="action_search")]
+        ]
+    )
+
+
+def review_keyboard(chat_key: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👍 Good", callback_data=f"rv:{chat_key}:good"),
+                InlineKeyboardButton(text="👎 Bad", callback_data=f"rv:{chat_key}:bad"),
+            ]
+        ]
+    )
+
+
+async def set_bot_commands():
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Start and set language"),
+            BotCommand(command="search", description="Find a partner"),
+            BotCommand(command="next", description="Skip to next partner"),
+            BotCommand(command="stop", description="End chat"),
+            BotCommand(command="report", description="Report your partner"),
+            BotCommand(command="privacy", description="How your data is handled"),
+        ]
+    )
 
 
 # =========================================================
-# TIMING
+# HELPERS
 # =========================================================
 
-last_sticker_time = defaultdict(float)
-
-STICKER_COOLDOWN = 120
-
-
-def calculate_reply_delay(
-    user_text: str,
-    reply_text: str,
-) -> float:
-
-    user_len = len(user_text.strip())
-    reply_len = len(reply_text.strip())
-
-    base = random.uniform(1.4, 2.4)
-
-    if reply_len <= 20:
-        base += random.uniform(0.3, 0.9)
-
-    elif reply_len <= 80:
-        base += random.uniform(0.8, 1.7)
-
-    else:
-        base += random.uniform(1.2, 2.3)
-
-    if user_len > 180:
-        base += random.uniform(0.4, 1.2)
-
-    return min(base, 6.5)
-
-
-async def keep_typing(
-    chat_id: int,
-    duration: float,
-):
-    end_time = time.monotonic() + duration
-
-    while time.monotonic() < end_time:
-
+async def safe_send(chat_id, text, **kwargs):
+    """send_message that never raises (returns None on failure)."""
+    try:
+        return await bot.send_message(chat_id, text, **kwargs)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
         try:
-            await bot.send_chat_action(
-                chat_id=chat_id,
-                action="typing",
-            )
-
+            return await bot.send_message(chat_id, text, **kwargs)
         except Exception:
-            pass
-
-        remaining = end_time - time.monotonic()
-
-        await asyncio.sleep(
-            min(
-                4.0,
-                max(
-                    0.5,
-                    remaining,
-                ),
-            )
-        )
-
-
-# =========================================================
-# STICKERS
-# =========================================================
-
-def has_real_sticker_id(
-    sticker_type: str,
-) -> bool:
-
-    values = STICKER_MAP.get(
-        sticker_type,
-        [],
-    )
-
-    return bool(values) and any(
-        value
-        and "..." not in value
-        for value in values
-    )
-
-
-def sticker_matches_scenario(
-    sticker_type: str,
-    user_message: str,
-    reply: str,
-) -> bool:
-
-    text = (
-        f"{user_message} {reply}"
-    ).lower()
-
-    if sticker_type == "laugh":
-        return any(
-            x in text
-            for x in [
-                "haha",
-                "hahaha",
-                "lol",
-                "lmao",
-                "😂",
-                "🤣",
-                "funny",
-                "joke",
-                "rofl",
-            ]
-        )
-
-    if sticker_type == "cry":
-        return any(
-            x in text
-            for x in [
-                "sad",
-                "cry",
-                "crying",
-                "tears",
-                "miss you",
-                "miss him",
-                "miss her",
-                "heartbroken",
-                "😭",
-                "💔",
-            ]
-        )
-
-    if sticker_type == "flirt":
-        return any(
-            x in text
-            for x in [
-                "cute",
-                "pretty",
-                "handsome",
-                "beautiful",
-                "crush",
-                "date",
-                "kiss",
-                "flirt",
-                "love you",
-                "😉",
-                "🥰",
-                "😘",
-            ]
-        )
-
-    if sticker_type == "angry":
-        return any(
-            x in text
-            for x in [
-                "angry",
-                "pissed",
-                "annoyed",
-                "mad",
-                "hate",
-                "irritating",
-                "wtf",
-                "ugh",
-            ]
-        )
-
-    if sticker_type == "wave":
-        return any(
-            x in text
-            for x in [
-                "hi",
-                "hello",
-                "hey",
-                "bye",
-                "goodbye",
-                "good morning",
-                "good night",
-            ]
-        )
-
-    return False
-
-
-def extract_sticker(ai_reply: str):
-    match = re.search(
-        r"\[STICKER:\s*(laugh|cry|flirt|angry|wave)\]",
-        ai_reply,
-        re.IGNORECASE,
-    )
-
-    if not match:
+            return None
+    except Exception as e:
+        logger.warning("send failed to %s: %s", chat_id, e)
         return None
 
-    return match.group(1).lower()
+
+async def find_chat(user_id: int):
+    return await chats_col.find_one(
+        {"$or": [{"user_1": user_id}, {"user_2": user_id}]}
+    )
 
 
-def clean_ai_reply(ai_reply: str) -> str:
-    return re.sub(
-        r"\[STICKER:\s*(?:laugh|cry|flirt|angry|wave)\]",
-        "",
-        ai_reply,
-        flags=re.IGNORECASE,
-    ).strip()
+def other_party(chat: dict, user_id: int):
+    return chat["user_2"] if chat["user_1"] == user_id else chat["user_1"]
+
+
+async def remember_user(user: types.User, **extra):
+    await users_col.update_one(
+        {"user_id": user.id},
+        {
+            "$set": {
+                "username": user.username,
+                "first_name": user.first_name,
+                **extra,
+            }
+        },
+        upsert=True,
+    )
+
+
+async def keep_typing(chat_id: int, duration: float):
+    end_time = time.monotonic() + duration
+    while time.monotonic() < end_time:
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        remaining = end_time - time.monotonic()
+        await asyncio.sleep(min(4.0, max(0.5, remaining)))
+
+
+async def stop_task(task):
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+def reply_delay(user_text: str, reply_text: str) -> float:
+    base = random.uniform(1.0, 2.0)
+    n = len(reply_text.strip())
+    if n <= 20:
+        base += random.uniform(0.2, 0.7)
+    elif n <= 80:
+        base += random.uniform(0.6, 1.4)
+    else:
+        base += random.uniform(1.0, 2.0)
+    if len(user_text) > 180:
+        base += random.uniform(0.3, 1.0)
+    return min(base, 5.5)
 
 
 # =========================================================
-# AI TASK MANAGEMENT
+# AI TASKS
 # =========================================================
 
-ai_tasks = {}
+ai_tasks: dict[int, asyncio.Task] = {}
+wait_tasks: dict[int, asyncio.Task] = {}
 
 
 def cancel_ai_task(user_id: int):
     task = ai_tasks.get(user_id)
-
     if task and not task.done():
         task.cancel()
 
 
-# =========================================================
-# AI RESPONSE
-# =========================================================
+async def call_model(messages):
+    last_error = None
+    for model in AI_MODELS:
+        try:
+            return await asyncio.wait_for(
+                ai_client.chat.completions.create(
+                    extra_headers={
+                        "HTTP-Referer": "https://shadowchatter-bot.onrender.com/",
+                        "X-Title": "ShadowChatter",
+                    },
+                    model=model,
+                    messages=messages,
+                ),
+                timeout=AI_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last_error = e
+            logger.warning("Model %s failed: %s", model, e)
+    raise RuntimeError(f"all models failed: {last_error}")
 
-async def generate_ai_response(
-    user_id: int,
-    user_message: str,
-    chat_id: int,
-):
 
+async def generate_ai_response(user_id: int, user_message: str, chat_id: int):
     try:
-
-        history_doc = await ai_history_col.find_one(
-            {"user_id": user_id}
-        )
-
+        history_doc = await ai_history_col.find_one({"user_id": user_id})
         messages = (
             history_doc["messages"]
             if history_doc
-            else [
-                {
-                    "role": "system",
-                    "content": AI_SYSTEM_PROMPT,
-                }
-            ]
+            else [{"role": "system", "content": AI_SYSTEM_PROMPT}]
         )
-
-        messages.append(
-            {
-                "role": "user",
-                "content": user_message,
-            }
-        )
-
-        # Keep history bounded.
+        messages.append({"role": "user", "content": user_message})
         if len(messages) > 13:
-            messages = [
-                messages[0]
-            ] + messages[-12:]
+            messages = [messages[0]] + messages[-12:]
 
-        # -------------------------------------------------
-        # MODEL REQUEST
-        # -------------------------------------------------
-
-        typing_duration = random.uniform(
-            1.8,
-            3.8,
-        )
-
-        typing_task = asyncio.create_task(
-            keep_typing(
-                chat_id,
-                typing_duration,
-            )
-        )
-
+        typing = asyncio.create_task(keep_typing(chat_id, random.uniform(2.0, 4.0)))
         try:
-
-            completion = (
-                await ai_client.chat.completions.create(
-                    extra_headers={
-                        "HTTP-Referer": (
-                            "https://shadowchatter-bot.onrender.com/"
-                        ),
-                        "X-Title": "ShadowChatter",
-                    },
-                    model=AI_MODEL,
-                    messages=messages,
-                )
-            )
-
+            completion = await call_model(messages)
         finally:
+            await stop_task(typing)
 
-            if not typing_task.done():
-                typing_task.cancel()
+        ai_reply = (completion.choices[0].message.content or "").strip() or "hmm"
 
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
-
-        ai_reply = (
-            completion.choices[0].message.content
-            or ""
-        ).strip()
-
-        if not ai_reply:
-            ai_reply = "hmm"
-
-        messages.append(
-            {
-                "role": "assistant",
-                "content": ai_reply,
-            }
-        )
-
+        messages.append({"role": "assistant", "content": ai_reply})
         await ai_history_col.update_one(
             {"user_id": user_id},
-            {
-                "$set": {
-                    "messages": messages,
-                    "updated_at": time.time(),
-                }
-            },
+            {"$set": {"messages": messages, "updated_at": time.time()}},
             upsert=True,
         )
 
-        sticker_type = extract_sticker(
-            ai_reply
-        )
-
-        clean_reply = clean_ai_reply(
-            ai_reply
-        )
-
-        # -------------------------------------------------
-        # NATURAL RESPONSE DELAY
-        # -------------------------------------------------
-
-        delay = calculate_reply_delay(
-            user_message,
-            clean_reply,
-        )
-
-        typing_task = asyncio.create_task(
-            keep_typing(
-                chat_id,
-                delay,
-            )
-        )
-
+        delay = reply_delay(user_message, ai_reply)
+        typing = asyncio.create_task(keep_typing(chat_id, delay))
         try:
             await asyncio.sleep(delay)
-
         finally:
+            await stop_task(typing)
 
-            if not typing_task.done():
-                typing_task.cancel()
-
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
-
-        # -------------------------------------------------
-        # VERIFY CHAT STILL EXISTS
-        # -------------------------------------------------
-
-        current_chat = await chats_col.find_one(
-            {
-                "$or": [
-                    {"user_1": user_id},
-                    {"user_2": user_id},
-                ]
-            }
-        )
-
-        if not current_chat:
+        # Still paired with the AI?
+        current = await find_chat(user_id)
+        if not current or other_party(current, user_id) != "AI_BOT":
             return
 
-        partner_id = (
-            current_chat["user_2"]
-            if current_chat["user_1"] == user_id
-            else current_chat["user_1"]
-        )
-
-        if partner_id != "AI_BOT":
-            return
-
-        # -------------------------------------------------
-        # SEND TEXT
-        # -------------------------------------------------
-
-        if clean_reply:
-
-            await bot.send_message(
-                chat_id,
-                clean_reply,
-            )
-
-        # -------------------------------------------------
-        # OPTIONAL STICKER
-        # -------------------------------------------------
-
-        now = time.monotonic()
-
-        if (
-            sticker_type
-            and has_real_sticker_id(
-                sticker_type
-            )
-            and (
-                now
-                - last_sticker_time[user_id]
-                >= STICKER_COOLDOWN
-            )
-            and sticker_matches_scenario(
-                sticker_type,
-                user_message,
-                clean_reply,
-            )
-        ):
-
-            await asyncio.sleep(
-                random.uniform(
-                    0.35,
-                    1.0,
-                )
-            )
-
-            await bot.send_sticker(
-                chat_id,
-                random.choice(
-                    STICKER_MAP[
-                        sticker_type
-                    ]
-                ),
-            )
-
-            last_sticker_time[user_id] = (
-                time.monotonic()
-            )
+        # parse_mode=None so "<" in model output can't break sending
+        await bot.send_message(chat_id, ai_reply, parse_mode=None)
 
     except asyncio.CancelledError:
         raise
-
     except Exception as e:
+        logger.exception("AI error for user %s: %s", user_id, e)
+        await safe_send(
+            chat_id,
+            "AI companion is having trouble right now. Try again, or use /next.",
+        )
+    finally:
+        if ai_tasks.get(user_id) is asyncio.current_task():
+            ai_tasks.pop(user_id, None)
 
-        logger.exception(
-            "AI Error for user %s: %s",
-            user_id,
-            e,
+
+# =========================================================
+# ARCHIVE (safety log -> topic in private supergroup)
+# =========================================================
+
+async def tg_call(fn, *args, **kwargs):
+    """Call a Telegram method, retrying on flood-wait."""
+    for _ in range(5):
+        try:
+            return await fn(*args, **kwargs)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+    return await fn(*args, **kwargs)
+
+
+def who(user_doc: dict, uid: int) -> str:
+    name = html.escape((user_doc or {}).get("first_name") or "?")
+    uname = (user_doc or {}).get("username")
+    uname_txt = f"@{html.escape(uname)}" if uname else "no username"
+    return f"{name} | {uname_txt} | <code>{uid}</code>"
+
+
+async def archive_chat(review: dict, tag: str):
+    chat_key = review["_id"]
+    refs = await msgs_col.find({"chat_key": chat_key}).sort("_id", 1).to_list(None)
+
+    try:
+        if ARCHIVE_GROUP_ID and refs:
+            group_id = int(ARCHIVE_GROUP_ID)
+
+            counter = await counters_col.find_one_and_update(
+                {"_id": "archive"},
+                {"$inc": {"n": 1}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            number = counter["n"]
+
+            users = review["users"]
+            docs = {u: await users_col.find_one({"user_id": u}) for u in users}
+            votes = review.get("votes", {})
+
+            topic = await tg_call(
+                bot.create_forum_topic,
+                chat_id=group_id,
+                name=f"{number:02d} | {tag.upper()}",
+            )
+            thread = topic.message_thread_id
+
+            lines = [f"<b>Chat {number:02d}</b> — tag: <b>{tag.upper()}</b>"]
+            for u in users:
+                lines.append(
+                    f"• {who(docs[u], u)} — rated partner: "
+                    f"<b>{votes.get(str(u), 'no vote')}</b>"
+                )
+            if review.get("reported_by"):
+                lines.append(f"🚩 reported by <code>{review['reported_by']}</code>")
+            await tg_call(
+                bot.send_message,
+                chat_id=group_id,
+                message_thread_id=thread,
+                text="\n".join(lines),
+            )
+
+            # copy in order, in runs of consecutive messages from one chat
+            i = 0
+            while i < len(refs):
+                src = refs[i]["from_chat"]
+                ids = []
+                while (
+                    i < len(refs)
+                    and refs[i]["from_chat"] == src
+                    and len(ids) < 100
+                ):
+                    ids.append(refs[i]["message_id"])
+                    i += 1
+                try:
+                    await tg_call(
+                        bot.copy_messages,
+                        chat_id=group_id,
+                        from_chat_id=src,
+                        message_ids=ids,
+                        message_thread_id=thread,
+                    )
+                except Exception as e:
+                    logger.warning("copy_messages failed: %s", e)
+    except Exception as e:
+        logger.exception("Archive failed: %s", e)
+    finally:
+        # nothing kept in the DB afterwards
+        await msgs_col.delete_many({"chat_key": chat_key})
+
+
+async def finalize_review(chat_key: str):
+    review = await reviews_col.find_one_and_delete({"_id": chat_key})
+    if not review:
+        return
+    votes = list(review.get("votes", {}).values())
+    if review.get("reported_by") or "bad" in votes:
+        tag = "bad"
+    elif "good" in votes:
+        tag = "good"
+    else:
+        tag = "unrated"
+    await archive_chat(review, tag)
+
+
+async def review_sweeper():
+    while True:
+        try:
+            await asyncio.sleep(60)
+            cutoff = time.time() - REVIEW_TIMEOUT
+            stale = await reviews_col.find({"created_at": {"$lt": cutoff}}).to_list(100)
+            for r in stale:
+                await finalize_review(r["_id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("sweeper error: %s", e)
+
+
+async def end_human_chat(chat: dict, ender_id: int, reported: bool = False):
+    """Chat doc is already deleted. Notify, ask for reviews."""
+    partner_id = other_party(chat, ender_id)
+    chat_key = str(chat["_id"])
+
+    review = {
+        "_id": chat_key,
+        "users": [chat["user_1"], chat["user_2"]],
+        "votes": {},
+        "created_at": time.time(),
+    }
+    if reported:
+        review["votes"][str(ender_id)] = "bad"
+        review["reported_by"] = ender_id
+    await reviews_col.replace_one({"_id": chat_key}, review, upsert=True)
+
+    await safe_send(ender_id, "you disconnected")
+    await safe_send(partner_id, "your partner disconnected")
+
+    for uid in (ender_id, partner_id):
+        if reported and uid == ender_id:
+            await safe_send(
+                uid,
+                "Thanks, the report was sent for review.",
+                reply_markup=search_keyboard(),
+            )
+            continue
+        await safe_send(
+            uid,
+            "How was your partner? (used only for safety)",
+            reply_markup=review_keyboard(chat_key),
         )
 
-        try:
-
-            await asyncio.sleep(
-                random.uniform(
-                    1.0,
-                    2.0,
-                )
-            )
-
-            await bot.send_message(
-                chat_id,
-                "give me a sec, something glitched",
-            )
-
-        except Exception:
-            pass
-
-    finally:
-
-        current_task = asyncio.current_task()
-
-        if (
-            ai_tasks.get(user_id)
-            is current_task
-        ):
-            ai_tasks.pop(
-                user_id,
-                None,
-            )
+    # if reporter already voted and partner never answers, sweeper handles it
 
 
 # =========================================================
 # MATCHMAKING
 # =========================================================
 
-async def execute_search(
-    user_id: int,
-    chat_id: int,
-):
-
-    existing_chat = await chats_col.find_one(
-        {
-            "$or": [
-                {"user_1": user_id},
-                {"user_2": user_id},
-            ]
-        }
-    )
-
-    if existing_chat:
-
-        await bot.send_message(
-            chat_id,
-            "you're already in a chat",
-        )
-
-        return
-
-    waiting = await queue_col.find_one(
-        {"user_id": user_id}
-    )
-
-    if waiting:
-
-        await bot.send_message(
-            chat_id,
-            "you're already waiting for a partner",
-        )
-
-        return
-
-    user_data = await users_col.find_one(
-        {"user_id": user_id}
-    )
-
-    user_lang = (
-        user_data.get(
-            "language",
-            "global",
-        )
-        if user_data
-        else "global"
-    )
-
-    waiting_partner = None
-
-    # -----------------------------------------------------
-    # SAME LANGUAGE
-    # -----------------------------------------------------
-
-    if user_lang != "global":
-
-        waiting_partner = (
-            await queue_col.find_one_and_delete(
-                {
-                    "user_id": {
-                        "$ne": user_id
-                    },
-                    "language": user_lang,
-                }
-            )
-        )
-
-    # -----------------------------------------------------
-    # GLOBAL FALLBACK
-    # -----------------------------------------------------
-
-    if not waiting_partner:
-
-        waiting_partner = (
-            await queue_col.find_one_and_delete(
-                {
-                    "user_id": {
-                        "$ne": user_id
-                    }
-                }
-            )
-        )
-
-    # -----------------------------------------------------
-    # HUMAN MATCH
-    # -----------------------------------------------------
-
-    if waiting_partner:
-
-        partner_id = waiting_partner[
-            "user_id"
-        ]
-
-        await chats_col.insert_one(
-            {
-                "user_1": user_id,
-                "user_2": partner_id,
-                "created_at": time.time(),
-            }
-        )
-
-        await bot.send_message(
-            user_id,
-            "partner found. say hi",
-        )
-
-        try:
-
-            await bot.send_message(
-                partner_id,
-                "partner found. say hi",
-            )
-
-        except Exception as e:
-
-            logger.warning(
-                "Could not notify partner %s: %s",
-                partner_id,
-                e,
-            )
-
-        return
-
-    # -----------------------------------------------------
-    # AI CHAT -> HUMAN MATCH
-    # -----------------------------------------------------
-
-    ai_chat = (
-        await chats_col.find_one_and_delete(
-            {
-                "user_2": "AI_BOT",
-                "user_1": {
-                    "$ne": user_id
-                },
-            }
-        )
-    )
-
-    if ai_chat:
-
-        user_a = ai_chat["user_1"]
-
-        cancel_ai_task(user_a)
-
-        await chats_col.insert_one(
-            {
-                "user_1": user_a,
-                "user_2": user_id,
-                "created_at": time.time(),
-            }
-        )
-
-        await bot.send_message(
-            user_a,
-            "your previous partner disconnected",
-        )
-
-        await asyncio.sleep(
-            random.uniform(
-                0.8,
-                1.6,
-            )
-        )
-
-        await bot.send_message(
-            user_a,
-            "someone new joined. say hi",
-        )
-
-        await bot.send_message(
-            user_id,
-            "partner found. say hi",
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # AI FALLBACK
-    # -----------------------------------------------------
-
-    await bot.send_message(
-        chat_id,
-        "looking for someone...",
-    )
-
-    await asyncio.sleep(
-        random.uniform(
-            2.5,
-            4.0,
-        )
-    )
-
+async def start_human_chat(user_a: int, user_b: int):
     await chats_col.insert_one(
-        {
-            "user_1": user_id,
-            "user_2": "AI_BOT",
-            "created_at": time.time(),
-        }
+        {"user_1": user_a, "user_2": user_b, "created_at": time.time()}
     )
+    await safe_send(user_a, "partner found. say hi 👋", reply_markup=chat_keyboard())
+    await safe_send(user_b, "partner found. say hi 👋", reply_markup=chat_keyboard())
 
-    await ai_history_col.delete_one(
-        {
-            "user_id": user_id
-        }
+
+async def wait_then_ai(user_id: int, chat_id: int):
+    try:
+        await asyncio.sleep(random.uniform(*HUMAN_WAIT_RANGE))
+        claimed = await queue_col.find_one_and_delete({"user_id": user_id})
+        if not claimed:
+            return  # someone matched with us meanwhile
+
+        await chats_col.insert_one(
+            {"user_1": user_id, "user_2": "AI_BOT", "created_at": time.time()}
+        )
+        await ai_history_col.delete_one({"user_id": user_id})
+
+        await safe_send(
+            chat_id,
+            "🤖 <b>No one is online right now.</b>\n"
+            "You're chatting with an <b>AI companion</b>. "
+            "If a real person joins, I'll connect you automatically.",
+            reply_markup=chat_keyboard(),
+        )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if wait_tasks.get(user_id) is asyncio.current_task():
+            wait_tasks.pop(user_id, None)
+
+
+async def execute_search(user_id: int, chat_id: int):
+    if await find_chat(user_id):
+        await safe_send(chat_id, "you're already in a chat")
+        return
+    if await queue_col.find_one({"user_id": user_id}):
+        await safe_send(chat_id, "you're already searching...")
+        return
+
+    user_data = await users_col.find_one({"user_id": user_id})
+    lang = (user_data or {}).get("language", "global")
+
+    # 1) waiting human, same language first
+    partner = None
+    if lang != "global":
+        partner = await queue_col.find_one_and_delete(
+            {"user_id": {"$ne": user_id}, "language": lang}
+        )
+    if not partner:
+        partner = await queue_col.find_one_and_delete({"user_id": {"$ne": user_id}})
+
+    if partner:
+        t = wait_tasks.pop(partner["user_id"], None)
+        if t:
+            t.cancel()
+        await start_human_chat(user_id, partner["user_id"])
+        return
+
+    # 2) a user currently talking to the AI -> hand them a real person
+    ai_chat = await chats_col.find_one_and_delete(
+        {"user_2": "AI_BOT", "user_1": {"$ne": user_id}}
     )
+    if ai_chat:
+        user_a = ai_chat["user_1"]
+        cancel_ai_task(user_a)
+        await chats_col.insert_one(
+            {"user_1": user_a, "user_2": user_id, "created_at": time.time()}
+        )
+        await safe_send(
+            user_a,
+            "🙋 A real person just joined. You're now chatting with them, say hi!",
+            reply_markup=chat_keyboard(),
+        )
+        await safe_send(user_id, "partner found. say hi 👋", reply_markup=chat_keyboard())
+        return
 
-    await bot.send_message(
-        user_id,
-        "partner found. say hi",
+    # 3) nobody: wait a few seconds, then fall back to the AI (disclosed)
+    await queue_col.insert_one(
+        {"user_id": user_id, "language": lang, "joined_at": time.time()}
     )
+    await safe_send(chat_id, "looking for someone...")
+    wait_tasks[user_id] = asyncio.create_task(wait_then_ai(user_id, chat_id))
 
 
-async def execute_stop(
-    user_id: int,
-    chat_id: int,
-):
-
-    # Cancel any running AI response.
+async def execute_stop(user_id: int, chat_id: int, reported: bool = False):
     cancel_ai_task(user_id)
+    t = wait_tasks.pop(user_id, None)
+    if t:
+        t.cancel()
 
-    # -----------------------------------------------------
-    # REMOVE FROM QUEUE
-    # -----------------------------------------------------
-
-    deleted = (
-        await queue_col.find_one_and_delete(
-            {"user_id": user_id}
-        )
-    )
-
+    deleted = await queue_col.find_one_and_delete({"user_id": user_id})
     if deleted:
-
-        await bot.send_message(
-            chat_id,
-            "you left the waiting queue",
-        )
-
+        await safe_send(chat_id, "you left the waiting queue", reply_markup=search_keyboard())
         return
 
-    # -----------------------------------------------------
-    # REMOVE ACTIVE CHAT
-    # -----------------------------------------------------
-
-    chat = (
-        await chats_col.find_one_and_delete(
-            {
-                "$or": [
-                    {"user_1": user_id},
-                    {"user_2": user_id},
-                ]
-            }
-        )
+    chat = await chats_col.find_one_and_delete(
+        {"$or": [{"user_1": user_id}, {"user_2": user_id}]}
     )
-
     if not chat:
-
-        await bot.send_message(
-            chat_id,
-            "you're not in a chat",
-        )
-
+        await safe_send(chat_id, "you're not in a chat", reply_markup=search_keyboard())
         return
 
-    partner_id = (
-        chat["user_2"]
-        if chat["user_1"] == user_id
-        else chat["user_1"]
-    )
+    partner_id = other_party(chat, user_id)
 
-    await bot.send_message(
-        chat_id,
-        "you disconnected",
-    )
+    if partner_id == "AI_BOT":
+        await safe_send(chat_id, "you disconnected", reply_markup=search_keyboard())
+        await ai_history_col.delete_one({"user_id": user_id})
+        return
 
-    if partner_id != "AI_BOT":
-
-        try:
-
-            await bot.send_message(
-                partner_id,
-                "your partner disconnected",
-            )
-
-        except Exception:
-            pass
+    await end_human_chat(chat, user_id, reported=reported)
 
 
 # =========================================================
-# /START
+# COMMANDS
 # =========================================================
 
 @router.message(Command("start"))
-async def cmd_start(
-    message: types.Message,
-):
-
-    gif_url = (
-        "https://media.giphy.com/media/"
-        "l41lFw057lAJQMwg0/giphy.gif"
-    )
-
+async def cmd_start(message: types.Message):
+    await remember_user(message.from_user)
+    gif_url = "https://media.giphy.com/media/l41lFw057lAJQMwg0/giphy.gif"
     try:
-
         await message.answer_animation(
             animation=gif_url,
-            caption=(
-                "<b>Welcome to Shadow Chatter!</b>\n\n"
-                "Choose your chat language:"
-            ),
-            reply_markup=get_language_keyboard(),
+            caption=WELCOME_TEXT,
+            reply_markup=language_keyboard(),
         )
-
     except Exception as e:
-
-        logger.warning(
-            "Start animation failed: %s",
-            e,
-        )
-
-        await message.answer(
-            (
-                "<b>Welcome to Shadow Chatter!</b>\n\n"
-                "Choose your chat language:"
-            ),
-            reply_markup=get_language_keyboard(),
-        )
+        logger.warning("Start animation failed: %s", e)
+        await message.answer(WELCOME_TEXT, reply_markup=language_keyboard())
 
 
-# =========================================================
-# LANGUAGE
-# =========================================================
+@router.message(Command("privacy"))
+async def cmd_privacy(message: types.Message):
+    await message.answer(PRIVACY_TEXT)
 
-@router.callback_query(
-    F.data.startswith("lang_")
-)
-async def set_language(
-    callback: CallbackQuery,
-):
 
-    lang_choice = callback.data.split(
-        "_",
-        1,
-    )[1]
-
-    await users_col.update_one(
-        {
-            "user_id": callback.from_user.id
-        },
-        {
-            "$set": {
-                "language": lang_choice
-            }
-        },
-        upsert=True,
-    )
+@router.callback_query(F.data.startswith("lang_"))
+async def set_language(callback: CallbackQuery):
+    lang_choice = callback.data.split("_", 1)[1]
+    await remember_user(callback.from_user, language=lang_choice)
 
     text = (
-        f"Language set to "
-        f"<b>{lang_choice.title()}</b>.\n\n"
-        "Use the button below to find a partner."
+        f"Language set to <b>{lang_choice.title()}</b>.\n\n"
+        "Tap below to find a partner."
     )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔍 Find a Partner",
-                    callback_data="action_search",
-                )
-            ]
-        ]
-    )
-
     try:
-
         if callback.message:
-
             await callback.message.edit_caption(
-                caption=text,
-                reply_markup=keyboard,
+                caption=text, reply_markup=search_keyboard()
             )
-
-    except Exception as e:
-
-        logger.warning(
-            "Could not edit language message: %s",
-            e,
-        )
-
+    except Exception:
         if callback.message:
-
-            await callback.message.answer(
-                text,
-                reply_markup=keyboard,
-            )
-
+            await callback.message.answer(text, reply_markup=search_keyboard())
     await callback.answer()
 
-
-# =========================================================
-# SEARCH
-# =========================================================
 
 @router.message(Command("search"))
-async def cmd_search(
-    message: types.Message,
-):
+async def cmd_search(message: types.Message):
+    await remember_user(message.from_user)
+    await execute_search(message.from_user.id, message.chat.id)
 
-    await execute_search(
-        message.from_user.id,
-        message.chat.id,
-    )
-
-
-# =========================================================
-# STOP
-# =========================================================
 
 @router.message(Command("stop"))
-async def cmd_stop(
-    message: types.Message,
-):
-
-    await execute_stop(
-        message.from_user.id,
-        message.chat.id,
-    )
+async def cmd_stop(message: types.Message):
+    await execute_stop(message.from_user.id, message.chat.id)
 
 
-# =========================================================
-# NEXT
-# =========================================================
+@router.message(Command("report"))
+async def cmd_report(message: types.Message):
+    await execute_stop(message.from_user.id, message.chat.id, reported=True)
+
 
 @router.message(Command("next"))
-async def cmd_next(
-    message: types.Message,
-):
+async def cmd_next(message: types.Message):
+    await execute_stop(message.from_user.id, message.chat.id)
+    await asyncio.sleep(random.uniform(0.4, 0.9))
+    await execute_search(message.from_user.id, message.chat.id)
 
-    await execute_stop(
-        message.from_user.id,
-        message.chat.id,
+
+@router.callback_query(F.data == "action_search")
+async def btn_search(callback: CallbackQuery):
+    await callback.answer()
+    await remember_user(callback.from_user)
+    await execute_search(callback.from_user.id, callback.message.chat.id)
+
+
+@router.callback_query(F.data == "action_stop")
+async def btn_stop(callback: CallbackQuery):
+    await callback.answer()
+    await execute_stop(callback.from_user.id, callback.message.chat.id)
+
+
+@router.callback_query(F.data == "action_report")
+async def btn_report(callback: CallbackQuery):
+    await callback.answer("Reported")
+    await execute_stop(callback.from_user.id, callback.message.chat.id, reported=True)
+
+
+@router.callback_query(F.data == "action_next")
+async def btn_next(callback: CallbackQuery):
+    await callback.answer()
+    await execute_stop(callback.from_user.id, callback.message.chat.id)
+    await asyncio.sleep(random.uniform(0.4, 0.9))
+    await execute_search(callback.from_user.id, callback.message.chat.id)
+
+
+# =========================================================
+# REVIEWS
+# =========================================================
+
+@router.callback_query(F.data.startswith("rv:"))
+async def on_review(callback: CallbackQuery):
+    try:
+        _, chat_key, vote = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer()
+        return
+
+    uid = callback.from_user.id
+    review = await reviews_col.find_one_and_update(
+        {"_id": chat_key, "users": uid},
+        {"$set": {f"votes.{uid}": vote}},
+        return_document=ReturnDocument.AFTER,
     )
 
-    await asyncio.sleep(
-        random.uniform(
-            0.4,
-            0.9,
+    if not review:
+        await callback.answer("Already recorded", show_alert=False)
+        return
+
+    await callback.answer("Thanks for the feedback!")
+    try:
+        await callback.message.edit_text(
+            "Thanks for the feedback!", reply_markup=search_keyboard()
         )
-    )
+    except Exception:
+        pass
 
-    await execute_search(
-        message.from_user.id,
-        message.chat.id,
-    )
-
-
-# =========================================================
-# SEARCH BUTTON
-# =========================================================
-
-@router.callback_query(
-    F.data == "action_search"
-)
-async def btn_search(
-    callback: CallbackQuery,
-):
-
-    await callback.answer()
-
-    await execute_search(
-        callback.from_user.id,
-        callback.message.chat.id,
-    )
+    if len(review.get("votes", {})) >= len(review["users"]):
+        await finalize_review(chat_key)
 
 
 # =========================================================
-# LEGACY STOP BUTTON
+# MESSAGE ROUTING
 # =========================================================
 
-@router.callback_query(
-    F.data == "action_stop"
-)
-async def btn_stop(
-    callback: CallbackQuery,
-):
-
-    await callback.answer()
-
-    await execute_stop(
-        callback.from_user.id,
-        callback.message.chat.id,
-    )
-
-
-# =========================================================
-# LEGACY NEXT BUTTON
-# =========================================================
-
-@router.callback_query(
-    F.data == "action_next"
-)
-async def btn_next(
-    callback: CallbackQuery,
-):
-
-    await callback.answer()
-
-    await execute_stop(
-        callback.from_user.id,
-        callback.message.chat.id,
-    )
-
-    await asyncio.sleep(
-        random.uniform(
-            0.4,
-            0.9,
-        )
-    )
-
-    await execute_search(
-        callback.from_user.id,
-        callback.message.chat.id,
-    )
-
-
-# =========================================================
-# MESSAGE TYPE DESCRIPTION
-# =========================================================
-
-def get_message_content(
-    message: types.Message,
-) -> str:
-
+def get_message_content(message: types.Message) -> str:
     if message.text:
         return message.text
-
     if message.caption:
         return message.caption
-
     if message.sticker:
-        return (
-            f"[User sent a sticker: "
-            f"{message.sticker.emoji or 'sticker'}]"
-        )
-
+        return f"[User sent a sticker: {message.sticker.emoji or 'sticker'}]"
+    if message.animation:
+        return "[User sent a GIF]"
     if message.photo:
         return "[User sent a photo]"
-
     if message.video:
         return "[User sent a video]"
-
     if message.voice:
         return "[User sent a voice message]"
-
     if message.video_note:
         return "[User sent a video note]"
-
     if message.document:
         return "[User sent a document]"
-
-    if message.animation:
-        return "[User sent a GIF/animation]"
-
     return "[User sent media]"
 
 
-# =========================================================
-# GENERAL MESSAGE ROUTING
-# =========================================================
-#
-# IMPORTANT:
-# This intentionally does NOT use:
-#
-#     @router.message(~F.text.startswith("/"))
-#
-# because that can miss non-text messages.
-#
-# Commands are already handled above.
-# Everything else reaches this handler.
-# =========================================================
-
 @router.message()
-async def handle_message(
-    message: types.Message,
-):
-
-    # Commands are handled by dedicated handlers.
+async def handle_message(message: types.Message):
     if message.text and message.text.startswith("/"):
         return
-
     if not message.from_user:
         return
 
     user_id = message.from_user.id
-
-    # -----------------------------------------------------
-    # FIND CHAT
-    # -----------------------------------------------------
-
-    chat = await chats_col.find_one(
-        {
-            "$or": [
-                {"user_1": user_id},
-                {"user_2": user_id},
-            ]
-        }
-    )
+    chat = await find_chat(user_id)
 
     if not chat:
-
-        await message.answer(
-            "you're not connected to anyone. use /search"
-        )
-
-        return
-
-    partner_id = (
-        chat["user_2"]
-        if chat["user_1"] == user_id
-        else chat["user_1"]
-    )
-
-    # -----------------------------------------------------
-    # AI CHAT
-    # -----------------------------------------------------
-
-    if partner_id == "AI_BOT":
-
-        user_text = get_message_content(
-            message
-        )
-
-        # Cancel previous AI response for this user.
-        #
-        # This prevents:
-        #
-        # user: hello
-        # user: are you there?
-        #
-        # from producing two overlapping AI responses.
-        cancel_ai_task(user_id)
-
-        task = asyncio.create_task(
-            generate_ai_response(
-                user_id,
-                user_text,
-                message.chat.id,
+        if await queue_col.find_one({"user_id": user_id}):
+            await message.answer("still looking for someone...")
+        else:
+            await message.answer(
+                "you're not connected to anyone. use /search",
+                reply_markup=search_keyboard(),
             )
-        )
-
-        ai_tasks[user_id] = task
-
         return
 
-    # -----------------------------------------------------
-    # HUMAN CHAT
-    # -----------------------------------------------------
+    partner_id = other_party(chat, user_id)
 
+    # ---------------- AI chat ----------------
+    if partner_id == "AI_BOT":
+        cancel_ai_task(user_id)
+        task = asyncio.create_task(
+            generate_ai_response(user_id, get_message_content(message), message.chat.id)
+        )
+        ai_tasks[user_id] = task
+        return
+
+    # ---------------- Human chat ----------------
     try:
-
         await bot.copy_message(
             chat_id=partner_id,
             from_chat_id=message.chat.id,
             message_id=message.message_id,
         )
-
-        # -------------------------------------------------
-        # PRIVATE ARCHIVE
-        # -------------------------------------------------
-
-        if LOG_CHANNEL_ID and (
-            message.photo
-            or message.video
-            or message.document
-            or message.voice
-            or message.video_note
-            or message.animation
-            or message.sticker
-        ):
-
-            try:
-
-                await bot.copy_message(
-                    chat_id=int(
-                        LOG_CHANNEL_ID
-                    ),
-                    from_chat_id=message.chat.id,
-                    message_id=message.message_id,
-                )
-
-            except Exception as archive_error:
-
-                logger.warning(
-                    "Archive failed: %s",
-                    archive_error,
-                )
-
+    except TelegramForbiddenError:
+        # partner blocked the bot: end this chat cleanly
+        gone = await chats_col.find_one_and_delete({"_id": chat["_id"]})
+        if gone:
+            await msgs_col.delete_many({"chat_key": str(chat["_id"])})
+            await message.answer(
+                "your partner left the chat",
+                reply_markup=search_keyboard(),
+            )
+        return
     except Exception as e:
+        # transient error: keep the chat alive
+        logger.warning("Routing error: %s", e)
+        await message.answer("couldn't send that one, try again")
+        return
 
-        logger.exception(
-            "Routing Error: %s",
-            e,
-        )
-
-        await message.answer(
-            "couldn't deliver that. your partner may have disconnected"
-        )
-
-        try:
-
-            await chats_col.delete_one(
+    # log reference for the safety archive (bounded)
+    chat_key = str(chat["_id"])
+    try:
+        count = await msgs_col.count_documents({"chat_key": chat_key}, limit=MAX_LOGGED_MESSAGES)
+        if count < MAX_LOGGED_MESSAGES:
+            await msgs_col.insert_one(
                 {
-                    "_id": chat["_id"]
+                    "chat_key": chat_key,
+                    "from_chat": message.chat.id,
+                    "message_id": message.message_id,
                 }
             )
-
-        except Exception:
-            pass
+    except Exception as e:
+        logger.warning("log ref failed: %s", e)
 
 
 # =========================================================
 # HEALTH / KEEP-ALIVE
 # =========================================================
 
-async def ping(
-    request: web.Request,
-):
-
-    # IMPORTANT:
-    # Keep this response extremely small.
-    #
-    # cron-job.org should receive only:
-    #
-    # OK
-    #
-    # HTTP 200.
+async def ping(request: web.Request):
     return web.Response(
-        text=HEALTH_RESPONSE,
+        text="OK",
         status=200,
         content_type="text/plain",
-        headers={
-            "Cache-Control": "no-store",
-        },
+        headers={"Cache-Control": "no-store"},
     )
 
-
-async def health(
-    request: web.Request,
-):
-
-    return web.Response(
-        text=HEALTH_RESPONSE,
-        status=200,
-        content_type="text/plain",
-        headers={
-            "Cache-Control": "no-store",
-        },
-    )
-
-
-# =========================================================
-# START HTTP SERVER
-# =========================================================
 
 async def start_http_server():
-
-    app = web.Application(
-        client_max_size=10 * 1024 * 1024
-    )
-
-    app.router.add_get(
-        "/",
-        ping,
-    )
-
-    app.router.add_get(
-        "/health",
-        health,
-    )
-
-    runner = web.AppRunner(
-        app
-    )
-
+    app = web.Application()
+    app.router.add_get("/", ping)
+    app.router.add_get("/health", ping)
+    runner = web.AppRunner(app)
     await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT,
-    )
-
-    await site.start()
-
-    logger.info(
-        "HTTP health server running on port %s",
-        PORT,
-    )
-
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    logger.info("HTTP health server running on port %s", PORT)
     return runner
 
 
 # =========================================================
-# SHUTDOWN
+# SHUTDOWN / MAIN
 # =========================================================
 
 async def shutdown():
-
-    logger.info(
-        "Shutting down ShadowChatter..."
-    )
-
-    # Cancel AI tasks.
-    for task in list(
-        ai_tasks.values()
-    ):
-
-        if not task.done():
-            task.cancel()
-
-    if ai_tasks:
-
-        await asyncio.gather(
-            *ai_tasks.values(),
-            return_exceptions=True,
-        )
-
+    logger.info("Shutting down ShadowChatter...")
+    pending = list(ai_tasks.values()) + list(wait_tasks.values())
+    for t in pending:
+        if not t.done():
+            t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
     ai_tasks.clear()
-
+    wait_tasks.clear()
     try:
         await bot.session.close()
     except Exception:
         pass
-
     try:
-        await client.close()
+        await mongo.close()
     except Exception:
         pass
 
 
-# =========================================================
-# MAIN
-# =========================================================
-
 async def main():
-
     http_runner = None
-
+    sweeper = None
     try:
+        await set_bot_commands()
+        dp.include_router(router)
+        await bot.delete_webhook(drop_pending_updates=True)
 
-        # -------------------------------------------------
-        # TELEGRAM COMMAND MENU
-        # -------------------------------------------------
+        http_runner = await start_http_server()
+        sweeper = asyncio.create_task(review_sweeper())
 
-        await set_bot_commands(
-            bot
-        )
+        # clear stale queue entries from a previous run
+        await queue_col.delete_many({})
 
-        # -------------------------------------------------
-        # REGISTER ROUTER
-        # -------------------------------------------------
-
-        dp.include_router(
-            router
-        )
-
-        # -------------------------------------------------
-        # REMOVE OLD WEBHOOK
-        # -------------------------------------------------
-
-        await bot.delete_webhook(
-            drop_pending_updates=True
-        )
-
-        # -------------------------------------------------
-        # START RENDER HEALTH SERVER
-        # -------------------------------------------------
-
-        http_runner = (
-            await start_http_server()
-        )
-
-        logger.info(
-            "ShadowChatter started successfully"
-        )
-
-        logger.info(
-            "Health endpoint: /health"
-        )
-
-        # -------------------------------------------------
-        # TELEGRAM POLLING
-        # -------------------------------------------------
-
-        await dp.start_polling(
-            bot
-        )
+        logger.info("ShadowChatter started successfully")
+        await dp.start_polling(bot)
 
     except asyncio.CancelledError:
-
-        logger.info(
-            "Main task cancelled"
-        )
-
+        logger.info("Main task cancelled")
     except Exception as e:
-
-        logger.exception(
-            "Fatal application error: %s",
-            e,
-        )
-
+        logger.exception("Fatal application error: %s", e)
         raise
-
     finally:
-
+        if sweeper:
+            sweeper.cancel()
         if http_runner:
-
             try:
                 await http_runner.cleanup()
             except Exception:
                 pass
-
         await shutdown()
 
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
-
 if __name__ == "__main__":
-
     try:
-
-        asyncio.run(
-            main()
-        )
-
+        asyncio.run(main())
     except KeyboardInterrupt:
-
-        logger.info(
-            "Stopped by user"
-        )
+        logger.info("Stopped by user")
